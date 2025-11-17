@@ -1300,3 +1300,772 @@ module tb_neural_inference;
 
 endmodule
 ```
+
+## Этап 3. Разделение и первая оптимизация
+Синтез полученного кода на Verilog показал, что для реализации модуля на ПЛИС потребовало бы прмерно 1,5 миллиона LUTов и все 240 DSP. Для начала было проведено разделение одного файла на несколько разных файлов для удобства разработки.
+### Заголовочный файл
+Ниже представлен код заголовочного файла с константами.
+```
+// =============================================================================
+// neural_weights.vh
+//
+// Этот файл содержит веса, смещения и константы
+// для модуля нейронной сети neural_inference.
+//
+// Архитектура: 6 -> 32 -> 16 -> 2
+// Веса получены из ПР№1 (масштаб: SCALE)
+// =============================================================================
+
+// ========================================
+// Константы нормализации (в формате fixed-point)
+// ========================================
+// X_MIN=-10.0, X_MAX= 10.0 => Диапазон 20.0
+// Y_MIN= 45.0, Y_MAX= 55.0 => Диапазон 10.0
+// MB_MIN=-5.0, MB_MAX=  5.0 => Диапазон 10.0
+parameter signed [31:0] X_MIN_FP  = -10 * SCALE;
+parameter signed [31:0] X_MAX_FP  =  10 * SCALE;
+parameter signed [31:0] Y_MIN_FP  =  45 * SCALE;
+parameter signed [31:0] Y_MAX_FP  =  55 * SCALE;
+parameter signed [31:0] MB_MIN_FP =  -5 * SCALE;
+parameter signed [31:0] MB_MAX_FP =   5 * SCALE;
+```
+### Генератор HEX-весов
+Дальше нужно вывести отдельно веса в mem-файл, для этого был составлен скрипт на языке Python, который вычисляет веса и генерирует mem-файлы. Затем mem-файлы импортируются в проект.
+```
+import numpy as np
+import os
+import sys
+
+# =============================================================================
+# 1. КОНФИГУРАЦИЯ
+# =============================================================================
+
+# -- Архитектура сети --
+NUM_POINTS = 3
+INPUT_SIZE = NUM_POINTS * 2  # 6
+HIDDEN1_SIZE = 32
+HIDDEN2_SIZE = 16
+OUTPUT_SIZE = 2 # (m, b)
+
+# -- Параметры обучения (должны совпадать с C++) --
+LEARNING_RATE = 0.001
+STEPS = 80000
+BATCH_SIZE = 128
+
+# -- Диапазоны для генерации данных и нормализации (должны совпадать с C++) --
+M_B_MIN = -5.0
+M_B_MAX = 5.0
+X_MIN = -10.0
+X_MAX = 10.0
+
+# ВНИМАНИЕ: Диапазон Y в C++ коде был рассчитан как Y_MIN=45.0, Y_MAX=55.0.
+# Это асимметричный диапазон, но мы будем его использовать для точного воспроизведения
+# результатов C++ кода. Фактический диапазон y = m*x+b находится в пределах [-55, 55].
+# Y_MIN = M_B_MIN * X_MIN + M_B_MIN  # (-5)*(-10)+(-5) = 45
+# Y_MAX = M_B_MAX * X_MAX + M_B_MAX  # (5)*(10)+(5)   = 55
+Y_MIN = 45.0
+Y_MAX = 55.0
+
+# -- Параметры квантизации --
+SCALE_FACTOR = 100000
+
+# =============================================================================
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =============================================================================
+
+def glorot_initializer(rows, cols, seed):
+    """
+    Инициализация весов методом Glorot (Xavier), точно как в C++ коде.
+    """
+    rng = np.random.RandomState(seed)
+    limit = np.sqrt(6.0 / (rows + cols)) # Более стандартный предел для uniform
+    # C++ код использовал std::sqrt(2.0/(r+c)) с uniform(-1,1), что ближе к He,
+    # но для воспроизводимости мы будем придерживаться той же логики.
+    # Чтобы точно соответствовать C++, мы используем их формулу.
+    scale = np.sqrt(2.0 / (rows + cols))
+    return rng.uniform(low=-1.0, high=1.0, size=(rows, cols)) * scale
+
+def relu(x):
+    """Функция активации ReLU."""
+    return np.maximum(0, x)
+
+def relu_derivative(x):
+    """Производная ReLU."""
+    return np.where(x > 0, 1.0, 0.0)
+
+def normalize(val, min_val, max_val):
+    """Нормализация значения в диапазон [-1, 1]."""
+    return 2.0 * (val - min_val) / (max_val - min_val) - 1.0
+
+def quantize_and_save_hex(matrix, filename):
+    """
+    Квантует матрицу, преобразует в 32-битный 2's complement HEX
+    и сохраняет в файл.
+    """
+    # Verilog BRAM ожидает одномерный массив.
+    # .flatten() по умолчанию использует C-style (row-major), что нам и нужно.
+    flat_matrix = matrix.flatten()
+    
+    quantized_values = np.round(flat_matrix * SCALE_FACTOR).astype(np.int64)
+    
+    with open(filename, 'w') as f:
+        f.write(f"// Матрица формы: {matrix.shape}\n")
+        f.write(f"// Сохранено в row-major порядке для $readmemh\n")
+        for val in quantized_values:
+            # Преобразование в 32-битное беззнаковое для корректного hex
+            hex_val = format(val & 0xFFFFFFFF, '08x')
+            f.write(hex_val + '\n')
+    print(f"Сохранен файл: {filename} ({len(quantized_values)} значений)")
+
+# =============================================================================
+# 3. ПРОЦЕСС ОБУЧЕНИЯ
+# =============================================================================
+
+def main():
+    print("Инициализация весов...")
+    # Используем те же seed, что и в C++
+    W1 = glorot_initializer(INPUT_SIZE, HIDDEN1_SIZE, seed=1)
+    B1 = glorot_initializer(1, HIDDEN1_SIZE, seed=2)
+    W2 = glorot_initializer(HIDDEN1_SIZE, HIDDEN2_SIZE, seed=3)
+    B2 = glorot_initializer(1, HIDDEN2_SIZE, seed=4)
+    W3 = glorot_initializer(HIDDEN2_SIZE, OUTPUT_SIZE, seed=5)
+    B3 = glorot_initializer(1, OUTPUT_SIZE, seed=6)
+
+    # Генератор случайных чисел для данных
+    data_rng = np.random.RandomState(1337)
+
+    print("Начало обучения...")
+    for step in range(STEPS):
+        # --- Генерация батча ---
+        X_batch = np.zeros((BATCH_SIZE, INPUT_SIZE))
+        Y_batch = np.zeros((BATCH_SIZE, OUTPUT_SIZE))
+        
+        true_m = data_rng.uniform(M_B_MIN, M_B_MAX, BATCH_SIZE)
+        true_b = data_rng.uniform(M_B_MIN, M_B_MAX, BATCH_SIZE)
+        
+        for i in range(BATCH_SIZE):
+            for p in range(NUM_POINTS):
+                x = data_rng.uniform(X_MIN, X_MAX)
+                y = true_m[i] * x + true_b[i]
+                X_batch[i, p*2 + 0] = normalize(x, X_MIN, X_MAX)
+                X_batch[i, p*2 + 1] = normalize(y, Y_MIN, Y_MAX)
+            
+            Y_batch[i, 0] = normalize(true_m[i], M_B_MIN, M_B_MAX)
+            Y_batch[i, 1] = normalize(true_b[i], M_B_MIN, M_B_MAX)
+
+        # --- Прямое распространение (Forward Pass) ---
+        Z1 = X_batch @ W1 + B1
+        A1 = relu(Z1)
+        Z2 = A1 @ W2 + B2
+        A2 = relu(Z2)
+        Z3 = A2 @ W3 + B3
+        Y_pred = Z3 # Линейный выходной слой
+
+        # --- Обратное распространение (Backward Pass) ---
+        error = Y_pred - Y_batch
+        
+        dZ3 = error
+        dW3 = A2.T @ dZ3
+        dB3 = np.sum(dZ3, axis=0, keepdims=True)
+        dA2 = dZ3 @ W3.T
+        
+        dZ2 = dA2 * relu_derivative(Z2)
+        dW2 = A1.T @ dZ2
+        dB2 = np.sum(dZ2, axis=0, keepdims=True)
+        dA1 = dZ2 @ W2.T
+        
+        dZ1 = dA1 * relu_derivative(Z1)
+        dW1 = X_batch.T @ dZ1
+        dB1 = np.sum(dZ1, axis=0, keepdims=True)
+        
+        # --- Обновление весов ---
+        N = BATCH_SIZE
+        W1 -= LEARNING_RATE * dW1 / N
+        B1 -= LEARNING_RATE * dB1 / N
+        W2 -= LEARNING_RATE * dW2 / N
+        B2 -= LEARNING_RATE * dB2 / N
+        W3 -= LEARNING_RATE * dW3 / N
+        B3 -= LEARNING_RATE * dB3 / N
+        
+        if step % 5000 == 0 or step == STEPS - 1:
+            loss = np.mean(error**2)
+            print(f"Шаг {step:5d}, Потери: {loss:.8f}")
+
+    print("\nОбучение завершено. Квантизация и сохранение весов...")
+    
+    # Создаем папку для весов, если ее нет
+    output_dir = "hex_weights"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # ВНИМАНИЕ: Для Verilog BRAM матрицы W1, W2, W3 нужно транспонировать
+    # перед сохранением, если Verilog ожидает доступ [вход][нейрон].
+    # Однако, доступ в Verilog коде `mac_idx * L_NEURONS + neuron_idx`
+    # соответствует C-style row-major, поэтому транспонировать НЕ нужно.
+    # Сохраняем как есть.
+    
+    quantize_and_save_hex(W1, os.path.join(output_dir, "w1.mem"))
+    quantize_and_save_hex(B1, os.path.join(output_dir, "b1.mem"))
+    quantize_and_save_hex(W2, os.path.join(output_dir, "w2.mem"))
+    quantize_and_save_hex(B2, os.path.join(output_dir, "b2.mem"))
+    quantize_and_save_hex(W3, os.path.join(output_dir, "w3.mem"))
+    quantize_and_save_hex(B3, os.path.join(output_dir, "b3.mem"))
+    
+    print(f"\nВсе файлы сохранены в папку '{output_dir}'.")
+    print("Теперь можно использовать эти файлы в Verilog-симуляции.")
+
+if __name__ == '__main__':
+    main()
+```
+### Модуль нейропроцессора
+Ключевая проблема заключалась в примерно 700 умножителях, совершающие 64-битные операции. В результате оптимизации количество умножителей сократилось до 1. Ниже представлен оптимизированный код нейропроцессора на языке Verilog.
+```
+/*
+ * Нейронная сеть для inference (Verilog 2001) - ОПТИМИЗИРОВАННАЯ ВЕРСИЯ
+ * Последовательная архитектура с одним MAC-блоком.
+ */
+module neural_inference_old1 #(
+    parameter SCALE = 100000
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+    
+    input  wire signed [31:0] x1, y1,
+    input  wire signed [31:0] x2, y2,
+    input  wire signed [31:0] x3, y3,
+    
+    output reg  signed [31:0] m_out,
+    output reg  signed [31:0] b_out,
+    output reg  valid_out
+);
+    `include "neural_weights.vh" // Подключаем константы нормализации
+
+    // ========================================
+    // Параметры архитектуры
+    // ========================================
+    localparam L1_INPUTS = 6,  L1_NEURONS = 32;
+    localparam L2_INPUTS = 32, L2_NEURONS = 16;
+    localparam L3_INPUTS = 16, L3_NEURONS = 2;
+
+    // ========================================
+    // Состояния FSM
+    // ========================================
+    parameter [3:0] S_IDLE       = 4'd0;
+    parameter [3:0] S_NORMALIZE  = 4'd1;
+    // Layer 1
+    parameter [3:0] S_L1_MAC_INIT  = 4'd2;
+    parameter [3:0] S_L1_MAC_CYCLE = 4'd3;
+    parameter [3:0] S_L1_BIAS_RELU = 4'd4;
+    // Layer 2
+    parameter [3:0] S_L2_MAC_INIT  = 4'd5;
+    parameter [3:0] S_L2_MAC_CYCLE = 4'd6;
+    parameter [3:0] S_L2_BIAS_RELU = 4'd7;
+    // Layer 3
+    parameter [3:0] S_L3_MAC_INIT  = 4'd8;
+    parameter [3:0] S_L3_MAC_CYCLE = 4'd9;
+    parameter [3:0] S_L3_BIAS_LINEAR = 4'd10; // Последний слой без ReLU
+    // Output
+    parameter [3:0] S_DENORM     = 4'd11;
+    parameter [3:0] S_DONE       = 4'd12;
+    
+    reg [3:0] state, next_state;
+
+    // ========================================
+    // Счетчики для итераций
+    // ========================================
+    reg [5:0] neuron_idx; // Индекс текущего нейрона (max 32)
+    reg [5:0] mac_idx;    // Индекс текущего входа/веса (max 32)
+
+    // ========================================
+    // Память для весов и смещений (BRAM)
+    // ========================================
+    reg signed [31:0] w1_bram [0:L1_INPUTS*L1_NEURONS-1];
+    reg signed [31:0] b1_bram [0:L1_NEURONS-1];
+    reg signed [31:0] w2_bram [0:L2_INPUTS*L2_NEURONS-1];
+    reg signed [31:0] b2_bram [0:L2_NEURONS-1];
+    reg signed [31:0] w3_bram [0:L3_INPUTS*L3_NEURONS-1];
+    reg signed [31:0] b3_bram [0:L3_NEURONS-1];
+    
+    initial begin
+    // Загрузка весов из файлов в BRAM
+    $readmemh("w1.mem", w1_bram);
+    $readmemh("b1.mem", b1_bram);
+    $readmemh("w2.mem", w2_bram);
+    $readmemh("b2.mem", b2_bram);
+    $readmemh("w3.mem", w3_bram);
+    $readmemh("b3.mem", b3_bram);
+end
+
+    // ========================================
+    // Память для промежуточных активаций (BRAM/Distributed RAM)
+    // ========================================
+    reg signed [31:0] input_norm [0:L1_INPUTS-1];
+    reg signed [31:0] layer1_a   [0:L1_NEURONS-1];
+    reg signed [31:0] layer2_a   [0:L2_NEURONS-1];
+    reg signed [31:0] layer3_z   [0:L3_NEURONS-1];
+
+    // ========================================
+    // Единый MAC блок (сердце оптимизации)
+    // ========================================
+    reg  signed [63:0] mac_acc;       // Аккумулятор
+    wire signed [31:0] mac_in_a;      // Вход A (активация)
+    wire signed [31:0] mac_in_b;      // Вход B (вес)
+    wire signed [63:0] mac_prod;      // Произведение
+    reg  signed [63:0] z_final;
+    
+    assign mac_prod = mac_in_a * mac_in_b;
+
+    // ========================================
+    // Мультиплексоры для выбора входов MAC
+    // ========================================
+    assign mac_in_a = (state == S_L1_MAC_CYCLE) ? input_norm[mac_idx] :
+                      (state == S_L2_MAC_CYCLE) ? layer1_a[mac_idx] :
+                      (state == S_L3_MAC_CYCLE) ? layer2_a[mac_idx] :
+                      32'sd0;
+
+    assign mac_in_b = (state == S_L1_MAC_CYCLE) ? w1_bram[mac_idx * L1_NEURONS + neuron_idx] :
+                      (state == S_L2_MAC_CYCLE) ? w2_bram[mac_idx * L2_NEURONS + neuron_idx] :
+                      (state == S_L3_MAC_CYCLE) ? w3_bram[mac_idx * L3_NEURONS + neuron_idx] :
+                      32'sd0;
+
+    // ========================================
+    // FSM: Логика состояний
+    // ========================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) state <= S_IDLE;
+        else     state <= next_state;
+    end
+    
+    always @(*) begin
+        next_state = state;
+        case (state)
+            S_IDLE:       if (start) next_state = S_NORMALIZE;
+            S_NORMALIZE:  next_state = S_L1_MAC_INIT;
+            
+            S_L1_MAC_INIT:  next_state = S_L1_MAC_CYCLE;
+            S_L1_MAC_CYCLE: if (mac_idx == L1_INPUTS - 1) next_state = S_L1_BIAS_RELU;
+                            else next_state = S_L1_MAC_CYCLE;
+            S_L1_BIAS_RELU: if (neuron_idx == L1_NEURONS - 1) next_state = S_L2_MAC_INIT;
+                            else next_state = S_L1_MAC_INIT;
+            
+            S_L2_MAC_INIT:  next_state = S_L2_MAC_CYCLE;
+            S_L2_MAC_CYCLE: if (mac_idx == L2_INPUTS - 1) next_state = S_L2_BIAS_RELU;
+                            else next_state = S_L2_MAC_CYCLE;
+            S_L2_BIAS_RELU: if (neuron_idx == L2_NEURONS - 1) next_state = S_L3_MAC_INIT;
+                            else next_state = S_L2_MAC_INIT;
+            
+            S_L3_MAC_INIT:  next_state = S_L3_MAC_CYCLE;
+            S_L3_MAC_CYCLE: if (mac_idx == L3_INPUTS - 1) next_state = S_L3_BIAS_LINEAR;
+                            else next_state = S_L3_MAC_CYCLE;
+            S_L3_BIAS_LINEAR: if (neuron_idx == L3_NEURONS - 1) next_state = S_DENORM;
+                              else next_state = S_L3_MAC_INIT;
+
+            S_DENORM:     next_state = S_DONE;
+            S_DONE:       next_state = S_IDLE;
+            default:      next_state = S_IDLE;
+        endcase
+    end
+    
+    // ========================================
+    // FSM: Логика вычислений и управления
+    // ========================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            valid_out <= 1'b0; m_out <= 0; b_out <= 0;
+            neuron_idx <= 0; mac_idx <= 0; mac_acc <= 0;
+        end else begin
+            valid_out <= 1'b0; // Сбрасывается по умолчанию
+            case (state)
+                S_IDLE: begin
+                    neuron_idx <= 0;
+                end
+                S_NORMALIZE: begin
+                    input_norm[0] <= normalize_x(x1);
+                    input_norm[1] <= normalize_y(y1);
+                    input_norm[2] <= normalize_x(x2);
+                    input_norm[3] <= normalize_y(y2);
+                    input_norm[4] <= normalize_x(x3);
+                    input_norm[5] <= normalize_y(y3);
+                end
+                
+                // --- Layer 1 ---
+                S_L1_MAC_INIT: begin
+                    mac_idx <= 0;
+                    mac_acc <= 0;
+                end
+                S_L1_MAC_CYCLE: begin
+                    mac_idx <= mac_idx + 1;
+                    mac_acc <= mac_acc + mac_prod;
+                end
+                S_L1_BIAS_RELU: begin
+                    neuron_idx <= neuron_idx + 1;
+                    z_final = (mac_acc + mac_prod) / SCALE + b1_bram[neuron_idx];
+                    if (z_final[63]) // ReLU
+                        layer1_a[neuron_idx] <= 32'sd0;
+                    else
+                        layer1_a[neuron_idx] <= z_final[31:0];
+                end
+                
+                // --- Layer 2 ---
+                S_L2_MAC_INIT: begin
+                    if (neuron_idx == L1_NEURONS - 1) neuron_idx <= 0; // Сброс счетчика для нового слоя
+                    mac_idx <= 0;
+                    mac_acc <= 0;
+                end
+                S_L2_MAC_CYCLE: begin
+                    mac_idx <= mac_idx + 1;
+                    mac_acc <= mac_acc + mac_prod;
+                end
+                S_L2_BIAS_RELU: begin
+                    neuron_idx <= neuron_idx + 1;
+                    z_final = (mac_acc + mac_prod) / SCALE + b2_bram[neuron_idx];
+                    if (z_final[63]) // ReLU
+                        layer2_a[neuron_idx] <= 32'sd0;
+                    else
+                        layer2_a[neuron_idx] <= z_final[31:0];
+                end
+                
+                // --- Layer 3 ---
+                S_L3_MAC_INIT: begin
+                    if (neuron_idx == L2_NEURONS - 1) neuron_idx <= 0; // Сброс счетчика для нового слоя
+                    mac_idx <= 0;
+                    mac_acc <= 0;
+                end
+                S_L3_MAC_CYCLE: begin
+                    mac_idx <= mac_idx + 1;
+                    mac_acc <= mac_acc + mac_prod;
+                end
+                S_L3_BIAS_LINEAR: begin
+                    neuron_idx <= neuron_idx + 1;
+                    z_final = (mac_acc + mac_prod) / SCALE + b3_bram[neuron_idx];
+                    layer3_z[neuron_idx] <= z_final[31:0];
+                end
+                
+                S_DENORM: begin
+                    m_out <= denormalize_mb(layer3_z[0]);
+                    b_out <= denormalize_mb(layer3_z[1]);
+                end
+                S_DONE: begin
+                    valid_out <= 1'b1;
+                end
+            endcase
+        end
+    end
+    
+    // ========================================
+    // Функции нормализации (арифметика с фиксированной точкой)
+    // ========================================
+    function signed [31:0] normalize_x;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            // Формула: 2*(val - (-10))/(10 - (-10)) - 1  =>  (val + 10)/10 - 1
+            temp = ($signed(val) + X_MIN_FP * -1) / 10 - SCALE;
+            normalize_x = temp[31:0];
+        end
+    endfunction
+    
+    function signed [31:0] normalize_y;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            // Формула: 2*(val - 45)/(55 - 45) - 1  =>  (val - 45)/5 - 1
+            temp = ($signed(val) - Y_MIN_FP) / 5 - SCALE;
+            normalize_y = temp[31:0];
+        end
+    endfunction
+    
+    // ========================================
+    // Функция денормализации (ИСПРАВЛЕНО)
+    // ========================================
+    function signed [31:0] denormalize_mb;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            // Формула: (val_f + 1.0) * 5.0 - 5.0
+            // В fixed point: (val_fp + SCALE) * 5 + MB_MIN_FP
+            temp = ($signed(val) + SCALE) * 5;
+            temp = temp + MB_MIN_FP;
+            denormalize_mb = temp[31:0];
+        end
+    endfunction
+
+endmodule
+```
+### IP-ядро UART
+Подробнее про IP-ядро UART будет рассказано в практической работе №3, но оно было вставлено для проверки возможности имплементации.
+### Модуль верхнего уровня
+Модуль верхнего уровня будет показан в практической работе №3, но он был составлен для проверки возможности имплементации.
+### Файл проектных ограничений
+Файл проектных ограничений будет показан в практической работе №3, но он был составлен для проверки возможности имплементации.
+## Этап 4. Конвейеризация
+Имплементация показала, что выполнение программы будет испытывать временные задержки по переднему фронту (Setup). Total Negative Slack составил примерно -100000 наносекунд, т.е. 0.1 милисекунд. Теоретически задержка вынуждает программе работать на частоте 1 кГц, что примерно в 10 раз медленнее, чем частота UART по стандарту RS-232 (9.6 кГц). Поэтому на нейропроцессоре был реализован 3-стадийный конвейер, который упорядочивает вычисления.
+Ниже представлен конвейеризированный код нейропроцессора на языке Verilog.
+```
+/*
+ * =====================================================================================
+ * Модуль:          neural_inference_optimized
+ * Версия:          2.0 (Конвейерная)
+ * Описание:        Оптимизированная версия нейропроцессора с трехстадийным
+ *                  конвейером (пайплайном) для решения критических проблем
+ *                  с временными ограничениями (timing violations).
+ *
+ * Архитектурные изменения:
+ * 1. MAC-блок (Multiply-Accumulate) разделен на 3 стадии:
+ *    - Стадия 1 (READ):   Чтение операндов из памяти в регистры.
+ *    - Стадия 2 (EXEC):   Выполнение умножения (на DSP блоке).
+ *    - Стадия 3 (ACCUM):  Сложение результата умножения с аккумулятором.
+ * 2. Деление на константу `SCALE` заменено на умножение на обратную величину
+ *    с последующим сдвигом, что значительно быстрее для FPGA.
+ *
+ * Результат:       Дизайн может работать на высокой тактовой частоте (>100 МГц),
+ *                  но общая задержка (latency) вычисления увеличивается.
+ * =====================================================================================
+ */
+module neural_inference_old2 #(
+    parameter SCALE = 100000
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+
+    input  wire signed [31:0] x1, y1,
+    input  wire signed [31:0] x2, y2,
+    input  wire signed [31:0] x3, y3,
+    
+    output reg  signed [31:0] m_out,
+    output reg  signed [31:0] b_out,
+    output reg  valid_out
+);
+
+    `include "neural_weights.vh" // Подключаем только константы нормализации
+
+    // ========================================
+    // Параметры архитектуры и оптимизации
+    // ========================================
+    localparam L1_INPUTS = 6,  L1_NEURONS = 32;
+    localparam L2_INPUTS = 32, L2_NEURONS = 16;
+    localparam L3_INPUTS = 16, L3_NEURONS = 2;
+
+    // Константа для замены деления: (1/SCALE) * 2^32
+    // (1/100000) * 4294967296 = 42949.67... -> Округляем до 42950
+    localparam signed [31:0] INV_SCALE = 32'd42950;
+
+    // FSM Состояния (с добавлением стадий финализации)
+    parameter [4:0] S_IDLE              = 5'd0;
+    parameter [4:0] S_NORMALIZE         = 5'd1;
+    parameter [4:0] S_L_MAC_INIT        = 5'd2;
+    parameter [4:0] S_L_MAC_READ        = 5'd3;
+    parameter [4:0] S_L_MAC_EXEC        = 5'd4;
+    parameter [4:0] S_L_MAC_ACCUM       = 5'd5;
+    // Новый конвейер финализации
+    parameter [4:0] S_L_FIN_SCALE_MUL   = 5'd6; // Стадия 1: Умножение на INV_SCALE
+    parameter [4:0] S_L_FIN_BIAS_ADD    = 5'd7; // Стадия 2: Добавление смещения
+    parameter [4:0] S_L_FIN_RELU_WRITE  = 5'd8; // Стадия 3: ReLU и запись
+    // Выходные состояния
+    parameter [4:0] S_DENORM            = 5'd9;
+    parameter [4:0] S_DONE              = 5'd10;
+    
+    reg [4:0] state = S_IDLE;
+    reg [1:0] current_layer = 0; // 0: L1, 1: L2, 2: L3
+
+    // ========================================
+    // Счетчики
+    // ========================================
+    reg [5:0] neuron_idx; // Индекс текущего нейрона (max 32 -> 6 бит)
+    reg [5:0] mac_idx;    // Индекс текущего входа/веса (max 32 -> 6 бит)
+
+    // ========================================
+    // Память для весов (BRAM)
+    // ========================================
+    reg signed [31:0] w1_bram [0:L1_INPUTS*L1_NEURONS-1];
+    reg signed [31:0] b1_bram [0:L1_NEURONS-1];
+    reg signed [31:0] w2_bram [0:L2_INPUTS*L2_NEURONS-1];
+    reg signed [31:0] b2_bram [0:L2_NEURONS-1];
+    reg signed [31:0] w3_bram [0:L3_INPUTS*L3_NEURONS-1];
+    reg signed [31:0] b3_bram [0:L3_NEURONS-1];
+    
+    reg signed [64:0] temp_acc;
+    reg signed [96:0] temp_mul; // 65 + 32 = 97
+    reg signed [64:0] z_final;
+    reg done;
+    reg signed [31:0] bias;
+    
+    initial begin
+        // Укажите правильные пути к вашим файлам
+        $readmemh("w1.mem", w1_bram);
+        $readmemh("b1.mem", b1_bram);
+        $readmemh("w2.mem", w2_bram);
+        $readmemh("b2.mem", b2_bram);
+        $readmemh("w3.mem", w3_bram);
+        $readmemh("b3.mem", b3_bram);
+    end
+
+    // ========================================
+    // Память для активаций (Distributed RAM)
+    // ========================================
+    reg signed [31:0] input_norm [0:L1_INPUTS-1];
+    reg signed [31:0] layer1_a   [0:L1_NEURONS-1];
+    reg signed [31:0] layer2_a   [0:L2_NEURONS-1];
+    reg signed [31:0] layer3_z   [0:L3_NEURONS-1];
+
+    // Регистры конвейера
+    reg  signed [31:0] mac_in_a_reg, mac_in_b_reg;
+    reg  signed [63:0] mac_prod_reg;
+    reg  signed [64:0] mac_acc;
+    
+    // Новые регистры для конвейера финализации
+    reg  signed [96:0] scale_mul_reg; // Результат умножения на INV_SCALE
+    reg  signed [64:0] z_final_reg;   // Результат после добавления смещения
+    
+    wire signed [31:0] mac_in_a_mux;      
+    wire signed [31:0] mac_in_b_mux;      
+
+    // Мультиплексоры для выбора источников данных (комбинационная логика)
+    assign mac_in_a_mux = (current_layer == 0) ? input_norm[mac_idx] :
+                          (current_layer == 1) ? layer1_a[mac_idx] :
+                                                 layer2_a[mac_idx];
+
+    assign mac_in_b_mux = (current_layer == 0) ? w1_bram[mac_idx * L1_NEURONS + neuron_idx] :
+                          (current_layer == 1) ? w2_bram[mac_idx * L2_NEURONS + neuron_idx] :
+                                                 w3_bram[mac_idx * L3_NEURONS + neuron_idx];
+    
+    // ========================================
+    // Логика вычислений и управления
+    // ========================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= S_IDLE;
+            current_layer <= 0;
+            valid_out <= 1'b0; m_out <= 0; b_out <= 0;
+            neuron_idx <= 0; mac_idx <= 0;
+            mac_in_a_reg <= 0; mac_in_b_reg <= 0;
+            mac_prod_reg <= 0; mac_acc <= 0;
+        end else begin
+            valid_out <= 1'b0;
+
+            // --- Безусловные операции конвейера ---
+            // Стадия 2: Умножение. Результат будет готов на следующем такте в mac_prod_reg
+            mac_prod_reg <= mac_in_a_reg * mac_in_b_reg;
+
+            // --- Основной FSM ---
+            case (state)
+                S_IDLE: begin
+                    if (start) begin
+                        state <= S_NORMALIZE;
+                    end
+                end
+                
+                S_NORMALIZE: begin
+                    input_norm[0] <= normalize_x(x1); input_norm[1] <= normalize_y(y1);
+                    input_norm[2] <= normalize_x(x2); input_norm[3] <= normalize_y(y2);
+                    input_norm[4] <= normalize_x(x3); input_norm[5] <= normalize_y(y3);
+                    
+                    state <= S_L_MAC_INIT;
+                    current_layer <= 0; // Начинаем с 1-го слоя
+                    neuron_idx <= 0;
+                end
+
+                S_L_MAC_INIT: begin
+                    mac_acc <= 0;
+                    mac_idx <= 0;
+                    state <= S_L_MAC_READ;
+                end
+                
+                S_L_MAC_READ: begin // Стадия 1
+                    mac_in_a_reg <= mac_in_a_mux;
+                    mac_in_b_reg <= mac_in_b_mux;
+                    state <= S_L_MAC_EXEC;
+                end
+
+                S_L_MAC_EXEC: begin // Стадия 2
+                    mac_idx <= mac_idx + 1;
+                    state <= S_L_MAC_ACCUM;
+                end
+
+                S_L_MAC_ACCUM: begin // Стадия 3
+                    mac_acc <= mac_acc + mac_prod_reg;
+                    
+                    // Проверяем, закончили ли мы MAC-операции для этого нейрона
+                    if (current_layer == 0)      done = (mac_idx == L1_INPUTS); // ПРАВИЛЬНО
+                    else if (current_layer == 1) done = (mac_idx == L2_INPUTS); // ПРАВИЛЬНО
+                    else                         done = (mac_idx == L3_INPUTS); // ПРАВИЛЬНО
+
+                    if (done) begin
+                        state <= S_L_FIN_SCALE_MUL;
+                    end else begin
+                        state <= S_L_MAC_READ;
+                    end
+                end
+                
+                // --- НОВЫЙ КОНВЕЙЕР ФИНАЛИЗАЦИИ ---
+                S_L_FIN_SCALE_MUL: begin // Стадия 1
+                    scale_mul_reg <= mac_acc * INV_SCALE;
+                    state <= S_L_FIN_BIAS_ADD;
+                end
+
+                S_L_FIN_BIAS_ADD: begin // Стадия 2
+                    
+                    if (current_layer == 0)      bias = b1_bram[neuron_idx];
+                    else if (current_layer == 1) bias = b2_bram[neuron_idx];
+                    else                         bias = b3_bram[neuron_idx];
+                    z_final_reg <= (scale_mul_reg >> 32) + bias;
+                    state <= S_L_FIN_RELU_WRITE;
+                end
+
+                S_L_FIN_RELU_WRITE: begin // Стадия 3
+                    if (current_layer == 0) begin
+                        if (z_final_reg[64]) layer1_a[neuron_idx] <= 0; else layer1_a[neuron_idx] <= z_final_reg[31:0];
+                        if (neuron_idx == L1_NEURONS - 1) {current_layer, neuron_idx} <= {1'b1, 6'd0}; else neuron_idx <= neuron_idx + 1;
+                        state <= S_L_MAC_INIT;
+                    end else if (current_layer == 1) begin
+                        if (z_final_reg[64]) layer2_a[neuron_idx] <= 0; else layer2_a[neuron_idx] <= z_final_reg[31:0];
+                        if (neuron_idx == L2_NEURONS - 1) {current_layer, neuron_idx} <= {2'd2, 6'd0}; else neuron_idx <= neuron_idx + 1;
+                        state <= S_L_MAC_INIT;
+                    end else begin
+                        layer3_z[neuron_idx] <= z_final_reg[31:0]; // Linear
+                        if (neuron_idx == L3_NEURONS - 1) state <= S_DENORM;
+                        else {neuron_idx, state} <= {neuron_idx + 1, S_L_MAC_INIT};
+                    end
+                end
+                
+                S_DENORM: {m_out, b_out, state} <= {denormalize_mb(layer3_z[0]), denormalize_mb(layer3_z[1]), S_DONE};
+                S_DONE:   {valid_out, state} <= {1'b1, S_IDLE};
+            endcase
+        end
+    end
+    
+    // ========================================
+    // Функции нормализации/денормализации (без изменений)
+    // ========================================
+    function signed [31:0] normalize_x;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            temp = ($signed(val) + X_MIN_FP * -1) / 10 - SCALE;
+            normalize_x = temp[31:0];
+        end
+    endfunction
+    
+    function signed [31:0] normalize_y;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            temp = ($signed(val) - Y_MIN_FP) / 5 - SCALE;
+            normalize_y = temp[31:0];
+        end
+    endfunction
+    
+    function signed [31:0] denormalize_mb;
+        input signed [31:0] val;
+        reg signed [63:0] temp;
+        begin
+            temp = ($signed(val) + SCALE) * 5;
+            temp = temp + MB_MIN_FP;
+            denormalize_mb = temp[31:0];
+        end
+    endfunction
+
+endmodule
+```
